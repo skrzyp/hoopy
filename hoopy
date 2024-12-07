@@ -1,0 +1,166 @@
+#!/bin/sh
+
+: ${HOOPY_IMAGES:="$PWD/images"}
+: ${HOOPY_RECIPES:="$PWD/recipes"}
+: ${HOOPY_APK_CACHE_DIR:="$PWD/cache/apk"}
+: ${HOOPY_APK_OPTS:="--no-progress --cache-dir ${HOOPY_APK_CACHE_DIR}"}
+: ${HOOPY_ALPINE_MIRROR:="http://dl-cdn.alpinelinux.org/alpine/"}
+: ${HOOPY_TMP_PACKAGES:=/tmp/hoopy.packages}
+: ${HOOPY_TMP_SERVICES:=/tmp/hoopy.services}
+
+ts()  { date +"%Y-%m-%d %H:%M:%S" ;}
+
+log() { echo "$(ts) $*" ; }
+err() { log  "[!] $*"; }
+die() { err  "$1" ; exit 1; }
+
+_apk() { apk ${HOOPY_APK_OPTS} "$@"; }
+
+pkg() { echo "$@" >> "${HOOPY_TMP_PACKAGES}";    }
+svc() { echo "$1=$2" >> "${HOOPY_TMP_SERVICES}"; }
+
+build() {
+    rootdir="${HOOPY_IMAGES}/$1/rootfs"
+    outdir="${HOOPY_IMAGES}/$1/output"
+    base_packages="alpine-base openrc-init alpine-baselayout alpine-release busybox busybox-suid musl-utils"
+    rm -f ${HOOPY_TMP_PACKAGES} ${HOOPY_TMP_SERVICES}
+    mkdir -p ${HOOPY_APK_CACHE_DIR}
+
+    . "${HOOPY_RECIPES}/$1/IMGBUILD"
+    packages
+    services
+
+    if [ -d "${rootdir}" ]; then
+        die "build: directory ${rootdir} not empty."
+    fi
+    log "Building $1"
+
+    log "Creating rootfs directory"
+    mkdir -p "${rootdir}"
+
+    log "Creating output directory"
+    mkdir -p "${outdir}"
+
+    log "Adding default repositories"
+    mkdir -p "${rootdir}/etc/apk"
+    cat > "${rootdir}"/etc/apk/repositories <<-EOF
+	${HOOPY_ALPINE_MIRROR}${branch}/main
+	${HOOPY_ALPINE_MIRROR}${branch}/community
+	EOF
+
+    log "Installing base packages"
+    _apk add --root "${rootdir}" --initdb --allow-untrusted ${base_packages}
+
+    log "Mocking initramfs generator"
+    _apk add --root "${rootdir}" --virtual initramfs-generator busybox
+
+    log "Installing firmware"
+    for fw in ${firmware}; do
+        _apk add --root "${rootdir}" linux-firmware-${fw}
+    done
+
+    log "Installing kernel package"
+    _apk add --root "${rootdir}" linux-${kernel}
+
+    log "Moving out kernel"
+    mv "${rootdir}/boot/"* "${outdir}"
+
+    log "Linking OpenRC as default init"
+    cd "${rootdir}"
+    ln -s "./sbin/openrc-init" "init"
+    cd "${outdir}"
+
+    log "Installing packages"
+    cat ${HOOPY_TMP_PACKAGES} | xargs apk add ${HOOPY_APK_OPTS}  --root "${rootdir}"
+
+    log "Setting up services"
+    for svline in $(cat ${HOOPY_TMP_SERVICES}); do
+        sv_name="$(echo ${svline} | cut -f1 -d'=')"
+        sv_runlevel="$(echo ${svline} | cut -f2 -d'=')"
+
+	log "Service $sv_name on runlevel $sv_runlevel"
+        ln -sn /etc/init.d/$sv_name "${rootdir}/etc/runlevels/$sv_runlevel/$sv_name"
+    done
+
+    log "Processing files"
+    files
+
+    log "Creating initramfs from rootfs"
+    cd "${rootdir}"
+    find . | cpio -o -H newc | gzip > "${outdir}/initramfs-lts"
+    cd "${outdir}"
+
+    log "Creating UKI image"
+    efi-mkuki \
+    	-c "${cmdline}" \
+    	-o "${outdir}/BOOTX64.EFI" \
+    	-r "${rootdir}/etc/os-release" \
+    	"${outdir}/vmlinuz-lts" "${outdir}/initramfs-lts"
+}
+
+qemu() {
+    cp /usr/share/ovmf/bios.bin /tmp/hoopy_bios.bin
+    qemu-system-x86_64 \
+    	-m 2G \
+    	-machine q35 \
+    	-pflash /tmp/hoopy_bios.bin \
+    	-kernel "${HOOPY_IMAGES}/${1}/output/BOOTX64.EFI" \
+    	-display sdl
+}
+
+usage() {
+    echo "$(basename $0) -- builds single file bootable Alpine Linux images"
+    echo
+    echo "Usage: $(basename $0) <command>"
+    echo
+    echo "Commands:"
+    echo
+    echo "  build <recipe>  builds the image from <recipe>"
+    echo "  list            lists available recipes with descriptions"
+    echo "  qemu <recipe>   launches QEMU instance for <recipe>"
+    echo
+    exit 0
+}
+
+[ ! -d "${HOOPY_IMAGES}"  ] && mkdir -p "${HOOPY_IMAGES}"
+[ ! -d "${HOOPY_RECIPES}" ] && mkdir -p "${HOOPY_RECIPES}"
+
+case "$1" in
+    build)
+        if [ "$2" = "" ]; then
+            die "$(basename $0) build: no recipe name given"
+        fi
+        if [ ! -f "${HOOPY_RECIPES}/${2}/IMGBUILD" ]; then
+            die "$(basename $0) build: cannot found ${HOOPY_RECIPES}/${2}/IMGBUILD"
+        fi
+        build "${2}"
+        ;;
+    list)
+        for imgbuild in $(find ${HOOPY_RECIPES} -type f -name "IMGBUILD"); do
+            imgname=$(grep -Eo '^imgname=(.*)' $imgbuild | cut -f 2 -d '=' | tr -d '"')
+            imgdesc=$(grep -Eo '^imgdesc=(.*)' $imgbuild | cut -f 2 -d '=' | tr -d '"')
+            echo "$imgname: $imgdesc"
+        done
+        ;;
+    qemu)
+        if [ "$2" = "" ]; then
+            die "$(basename $0) qemu: no image name given"
+        fi
+        if [ ! -f "${HOOPY_IMAGES}/${2}/output/BOOTX64.EFI" ]; then
+            die "$(basename $0) qemu: no image found for ${2}"
+        fi
+        qemu "$2"
+        ;;
+    clean)
+        if [ "$2" = "" ]; then
+            die "$(basename $0) clean: no recipe name given"
+        fi
+        rm -rf "${HOOPY_IMAGES}/${2}"
+        ;;
+    ""|"help"|"-h"|"--help")
+        usage
+        ;;
+    *)
+        die "$(basename $0) $1: unknown command"
+        ;;
+esac

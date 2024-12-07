@@ -1,0 +1,58 @@
+imgname=nas
+imgdesc="Simple NAS setup with samba and ZFS"
+arch="x86_64"
+branch="latest-stable"
+hostname="nas"
+kernel="lts"
+firmware="none"
+cmdline="mitigations=off"
+
+packages() {
+  pkg zfs-lts
+  pkg mdevd
+  pkg metalog
+  pkg agetty
+}
+
+files() {
+  log "Enabling getty on serial on"
+  sed -i 's/^\#ttyS0/ttyS0/' "${rootdir}/etc/inittab"
+
+  log "Enabling parallel OpenRC"
+  sed -i 's/^\#rc_parallel=\"NO\"/rc_parallel=\"YES\"/' "${rootdir}/etc/rc.conf"
+
+  log "Adding default network config"
+  cat > ${rootdir}/etc/network/interfaces <<EOF
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+EOF
+
+}
+
+users() {}
+
+services() {
+  svc devfs sysinit
+  svc dmesg sysinit
+  svc mdevd-init sysinit
+  svc mdevd sysinit
+
+  svc hwclock boot
+  svc modules boot
+  svc sysctl boot
+  svc hostname boot
+  svc bootmisc boot
+  svc metalog boot
+  svc networking boot
+  svc seedrng boot
+  svc zfs-import boot
+
+  svg agetty default
+
+  svc mount-ro shutdown
+  svc killprocs shutdown
+}
+
